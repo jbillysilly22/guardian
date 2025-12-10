@@ -1,0 +1,44 @@
+# ---- Python stuff ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.sqlite3
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ---- VS Code ----
+.vscode/
+.vs/
+*.code-workspace
+VSWorkspaceState.json
+
+# ---- Copilot / Microsoft internal caches ----
+CopilotIndices/
+FileContentIndex/
+*.vsidx
+*.vsidr
+
+# Temporary files
+*.tmp
+*.log
+*.swp
+*~
+*.backup
+*.bak
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Build / dist
+dist/
+build/
