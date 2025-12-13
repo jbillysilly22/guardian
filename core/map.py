@@ -10,7 +10,7 @@ world_map = folium.Map(
     tiles="CartoDB positron",
 )
 
-usa_counties = gpd.read_file("core/map_data/gz_2010_us_050_500k.json")
+usa_counties = gpd.read_file("core/map_data/gz_2010_us_050_00_500k.json")
 
 usa_counties_gdf = usa_counties.to_crs(epsg=4326)
 
