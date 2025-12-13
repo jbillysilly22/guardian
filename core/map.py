@@ -1,29 +1,46 @@
 from pathlib import Path
 import folium
 import geopandas as gpd
+import fiona
 
-#world map but location set to center of USA also using geopandas to read in a geojson file of USA counties
-world_map = folium.Map(
-    location=[39.5,-98.35],
-    control_scale=True,
-    zoom_start = 4,
+
+USA_SW = [24.0, -130.0]
+USA_NE = [50.0, -67.79]
+
+
+m = folium.Map(
+    location=[39.5, -98.35],
+    zoom_start=4,
     tiles="CartoDB positron",
+    control_scale=True,
+    max_bounds=True,
 )
 
-usa_counties = gpd.read_file("core/map_data/gz_2010_us_050_00_500k.json")
+m.fit_bounds([USA_SW, USA_NE])  
 
-usa_counties_gdf = usa_counties.to_crs(epsg=4326)
 
-usa_counties_json = usa_counties_gdf.to_json()
+BASE_DIR = Path(__file__).resolve().parent
+COUNTIES_PATH = BASE_DIR / "map_data" / "gz_2010_us_050_00_500k.json"
 
-usa_counties_layer = folium.GeoJson(
-    usa_counties_json,
+
+gdf = gpd.read_file(COUNTIES_PATH, engine="fiona")  
+gdf = gdf.to_crs(epsg=4326)
+
+folium.GeoJson(
+    gdf.to_json(),
     name="USA Counties",
     style_function=lambda feature: {
         "fillColor": "lightgray",
         "color": "black",
         "weight": 0.5,
-        "fillOpacity": 0.5,
+        "fillOpacity": 0.3,
     },
-)
+).add_to(m)
+
+folium.LayerControl().add_to(m)
+
+m.save(str(BASE_DIR / "map.html"))
+print("Saved:", BASE_DIR / "map.html")
+
+
 
