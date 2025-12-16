@@ -9,6 +9,7 @@ REPO_ROOT = THIS_FILE.parents[3]  # guardian/
 sys.path.insert(0, str(REPO_ROOT))
 
 import logging
+import sys
 import time
 import json
 from dataclasses import dataclass
@@ -16,16 +17,15 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
-    iter_dataset_rows,
-    FetchConfig,
-    _make_session,
-)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_catalog import (
     collect_datasets,
     ChicagoDataset,
 )
-
 
 log = logging.getLogger(__name__)
 
