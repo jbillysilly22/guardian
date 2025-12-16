@@ -1,16 +1,31 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
+import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+
+THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = THIS_FILE.parents[3]  # guardian/
+sys.path.insert(0, str(REPO_ROOT))
+
 import logging
 import time
 import json
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from data_endpoint_catalog import collect_datasets, ChicagoDataset
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
+    iter_dataset_rows,
+    FetchConfig,
+    _make_session,
+)
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_catalog import (
+    collect_datasets,
+    ChicagoDataset,
+)
+
 
 log = logging.getLogger(__name__)
 
