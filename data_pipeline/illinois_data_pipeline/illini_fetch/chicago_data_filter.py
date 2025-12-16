@@ -6,10 +6,22 @@ import datetime as dt
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
+import sys
 
 
-from .chicago_data_fetcher import iter_dataset_rows, FetchConfig, _make_session
-from .chicago_data_endpoint_catalog import collect_datasets, ChicagoDataset
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
+    iter_dataset_rows,
+    FetchConfig,
+    _make_session,
+)
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_catalog import (
+    collect_datasets,
+    ChicagoDataset,
+)
 
 log = logging.getLogger(__name__)
 
