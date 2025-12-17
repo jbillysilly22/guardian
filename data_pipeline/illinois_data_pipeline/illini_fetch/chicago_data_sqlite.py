@@ -1,0 +1,220 @@
+﻿# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import logging
+import sqlite3
+import sys
+import time
+import json
+import hashlib
+from pathlib import Path
+from typing import Dict, Any, Optional
+import datetime as dt
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
+    iter_dataset_rows,
+    FetchConfig,
+    _make_session,
+)
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_catalog import (
+    collect_datasets,
+    ChicagoDataset,
+)
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import (
+    enrich_row,
+)
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+CRIME_DATASET_ID = "ijzp-q8t2"  # Chicago crimes dataset id used elsewhere in repo
+INTERVAL_SECONDS = 60 * 10  # how often to poll (10 minutes)
+DB_DIR = PROJECT_ROOT / "data_pipeline" / "illinois_data_pipeline" / "illini_fetch" / "chicago_filtered_data"
+DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "violent_crimes.sqlite"
+
+
+def _ensure_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS violent_crimes (
+            case_number TEXT PRIMARY KEY,
+            row_hash TEXT,
+            datetime TEXT,
+            primary_type TEXT,
+            primary_type_norm TEXT,
+            description TEXT,
+            location_description TEXT,
+            arrest INTEGER,
+            domestic INTEGER,
+            beat INTEGER,
+            district INTEGER,
+            ward INTEGER,
+            community_area INTEGER,
+            fbi_code TEXT,
+            x_coordinate INTEGER,
+            y_coordinate INTEGER,
+            latitude REAL,
+            longitude REAL,
+            lat REAL,
+            lon REAL,
+            grid_id TEXT,
+            severity REAL,
+            is_violent INTEGER,
+            domain TEXT,
+            raw_json TEXT,
+            last_seen_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _make_case_key(row: Dict[str, Any]) -> str:
+    
+    case = row.get("case_number") or row.get("case") or row.get("id")
+    if case:
+        return str(case)
+    # stable hash for rows without a case number
+    raw = json.dumps({k: row.get(k) for k in sorted(row.keys())}, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None:
+    cur = conn.cursor()
+    key = _make_case_key(enriched)
+    row_hash = hashlib.sha1(json.dumps(enriched, sort_keys=True, default=str).encode()).hexdigest()
+    now = dt.datetime.utcnow().isoformat()
+
+    # map fields; use .get to avoid KeyError
+    vals = {
+        "case_number": key,
+        "row_hash": row_hash,
+        "datetime": enriched.get("datetime"),
+        "primary_type": enriched.get("primary_type") or enriched.get("offense") or enriched.get("category"),
+        "primary_type_norm": enriched.get("primary_type_norm"),
+        "description": enriched.get("description"),
+        "location_description": enriched.get("location_description"),
+        "arrest": int(bool(enriched.get("arrest"))) if enriched.get("arrest") is not None else None,
+        "domestic": int(bool(enriched.get("domestic"))) if enriched.get("domestic") is not None else None,
+        "beat": enriched.get("beat"),
+        "district": enriched.get("district"),
+        "ward": enriched.get("ward"),
+        "community_area": enriched.get("community_area"),
+        "fbi_code": enriched.get("fbi_code"),
+        "x_coordinate": enriched.get("x_coordinate"),
+        "y_coordinate": enriched.get("y_coordinate"),
+        "latitude": enriched.get("latitude") or enriched.get("lat"),
+        "longitude": enriched.get("longitude") or enriched.get("lon"),
+        "lat": enriched.get("lat"),
+        "lon": enriched.get("lon"),
+        "grid_id": enriched.get("grid_id"),
+        "severity": enriched.get("severity"),
+        "is_violent": int(bool(enriched.get("is_violent"))),
+        "domain": enriched.get("domain"),
+        "raw_json": json.dumps(enriched, ensure_ascii=False),
+        "last_seen_at": now,
+    }
+
+    
+    cur.execute(
+        """
+        INSERT INTO violent_crimes (
+            case_number, row_hash, datetime, primary_type, primary_type_norm, description,
+            location_description, arrest, domestic, beat, district, ward, community_area,
+            fbi_code, x_coordinate, y_coordinate, latitude, longitude, lat, lon, grid_id,
+            severity, is_violent, domain, raw_json, last_seen_at
+        ) VALUES (
+            :case_number, :row_hash, :datetime, :primary_type, :primary_type_norm, :description,
+            :location_description, :arrest, :domestic, :beat, :district, :ward, :community_area,
+            :fbi_code, :x_coordinate, :y_coordinate, :latitude, :longitude, :lat, :lon, :grid_id,
+            :severity, :is_violent, :domain, :raw_json, :last_seen_at
+        )
+        ON CONFLICT(case_number) DO UPDATE SET
+            row_hash=excluded.row_hash,
+            datetime=excluded.datetime,
+            primary_type=excluded.primary_type,
+            primary_type_norm=excluded.primary_type_norm,
+            description=excluded.description,
+            location_description=excluded.location_description,
+            arrest=excluded.arrest,
+            domestic=excluded.domestic,
+            beat=excluded.beat,
+            district=excluded.district,
+            ward=excluded.ward,
+            community_area=excluded.community_area,
+            fbi_code=excluded.fbi_code,
+            x_coordinate=excluded.x_coordinate,
+            y_coordinate=excluded.y_coordinate,
+            latitude=excluded.latitude,
+            longitude=excluded.longitude,
+            lat=excluded.lat,
+            lon=excluded.lon,
+            grid_id=excluded.grid_id,
+            severity=excluded.severity,
+            is_violent=excluded.is_violent,
+            domain=excluded.domain,
+            raw_json=excluded.raw_json,
+            last_seen_at=excluded.last_seen_at
+        """,
+        vals,
+    )
+    conn.commit()
+
+
+def _find_crime_dataset() -> Optional[ChicagoDataset]:
+    datasets = collect_datasets()
+    ds = next((d for d in datasets if d.dataset_id == CRIME_DATASET_ID), None)
+    if not ds:
+        log.error("Crime dataset %s not found in catalog", CRIME_DATASET_ID)
+    return ds
+
+
+def run_forever(poll_interval: int = INTERVAL_SECONDS) -> None:
+    cfg = FetchConfig(per_page=1000, pause_s=0.2, timeout_s=15, app_token=None)
+    session = _make_session(cfg.app_token)
+    ds = _find_crime_dataset()
+    if not ds:
+        return
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    _ensure_table(conn)
+    log.info("Started continuous pull → DB: %s (interval %ds)", DB_PATH, poll_interval)
+
+    try:
+        while True:
+            count_inserted = 0
+            count_seen = 0
+            try:
+                for raw_row in iter_dataset_rows(ds, session=session, cfg=cfg):
+                    count_seen += 1
+                    enriched = enrich_row(raw_row)
+                    # only store violent rows (matches filter behavior in your snippet)
+                    if not enriched.get("is_violent"):
+                        continue
+                    _upsert_enriched(conn, enriched)
+                    count_inserted += 1
+            except Exception:
+                log.exception("Error while fetching/enriching rows; will continue on next cycle")
+
+            log.info("Cycle complete: seen=%d violent_saved=%d", count_seen, count_inserted)
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        log.info("Interrupted by user; shutting down")
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    run_forever()
+
+
+
+    #watch for bad sqlite and bad dtc deprecation warnings gotta upddate stuff

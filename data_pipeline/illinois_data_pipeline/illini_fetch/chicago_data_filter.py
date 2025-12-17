@@ -126,9 +126,7 @@ def enrich_row(row: Dict[str, Any]) -> Dict[str, Any]:
     )
     return enriched
 
-# ------------------
-# RUNNER
-# ------------------
+
 
 def run_enrichment(
     dataset_id: str,
@@ -165,16 +163,19 @@ def run_enrichment(
     return out_file
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
 
-    TARGET_DATASET_ID = "85ca-t3if"  # Traffic Crashes – Crashes
+if __name__ == "__main__":
+    DATASET_IDS = [
+        "85ca-t3if",  # Traffic Crashes
+        "ijzp-q8t2",  # Crimes
+    ]
 
     cfg = FetchConfig(
         per_page=1000,
-        max_pages=2,
+        max_pages=2,   # bump to 10 to test more
         pause_s=0.2,
         timeout_s=15,
     )
 
-    run_enrichment(TARGET_DATASET_ID, cfg=cfg)
+    for dsid in DATASET_IDS:
+        run_enrichment(dsid, cfg=cfg)

@@ -43,3 +43,13 @@ Thumbs.db
 # Build / dist
 dist/
 build/
+
+
+# local artifacts
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+__pycache__/
+
