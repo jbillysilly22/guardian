@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+
+def project_root() -> Path:
+    # core/paths.py lives at <repo_root>/core/paths.py
+    return Path(__file__).resolve().parents[1]
 
 def app_data_dir(app_name: str = "guardian") -> Path:
     override = os.environ.get("GUARDIAN_DATA_DIR")

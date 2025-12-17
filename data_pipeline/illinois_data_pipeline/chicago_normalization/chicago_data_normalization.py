@@ -1,159 +1,225 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
-from typing import Iterable, List, Optional
-
-import pandas as pd
+import math
 import sqlite3
-import tensorflow as tf
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple
+
+from core.paths import app_data_dir
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
-# defaults — adjust paths to match your repo layout
-THIS_FILE = Path(__file__).resolve()
-DB_PATH = THIS_FILE.parents[2] / "illini_fetch" / "chicago_filtered_data" / "violent_crimes.sqlite"
-NORMALIZER_DIR = THIS_FILE.parents[2] / "illini_fetch" / "normalizer_saved"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def _load_enriched_from_sqlite(db_path: Path = DB_PATH) -> pd.DataFrame:
+# ---- config ----
+DB_PATH = app_data_dir("guardian") / "violent_crimes.sqlite"
+LOOKBACK_DAYS_BASELINE = 365
+LOOKBACK_DAYS_30 = 30
+LOOKBACK_DAYS_7 = 7
+
+# weights: tune later
+W_30D = 0.55
+W_7D = 0.30
+W_365D = 0.15
+
+# clamp outputs
+MIN_SCORE = 0
+MAX_SCORE = 100
+
+
+@dataclass
+class GridCounts:
+    c7: int
+    c30: int
+    c365: int
+    sev30_sum: float
+    sev30_n: int
+
+
+def _iso_utc(dt_obj: datetime) -> str:
+    return dt_obj.astimezone(timezone.utc).replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_dt(s: str) -> datetime | None:
+    if not s:
+        return None
+    try:
+        # handles "2025-12-17T00:56:14" and "2025-12-17T00:56:14Z"
+        if s.endswith("Z"):
+            return datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _percentile(sorted_vals: List[int], p: float) -> int:
+    """Nearest-rank percentile, p in [0,1]."""
+    if not sorted_vals:
+        return 0
+    k = max(0, min(len(sorted_vals) - 1, int(math.ceil(p * len(sorted_vals))) - 1))
+    return sorted_vals[k]
+
+
+def _log_norm(x: float, p95: float) -> float:
+    """Log normalize to [0,1] using p95 anchor."""
+    if p95 <= 0:
+        return 0.0
+    return min(1.0, math.log1p(max(0.0, x)) / math.log1p(p95))
+
+
+def _ensure_risk_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS risk_grid (
+            grid_id TEXT PRIMARY KEY,
+            count_7d INTEGER,
+            count_30d INTEGER,
+            count_365d INTEGER,
+            severity_avg_30d REAL,
+            score_0_100 INTEGER,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _load_counts(conn: sqlite3.Connection) -> Dict[str, GridCounts]:
     """
-    Load the enriched rows saved into the backfill DB.
-    The backfill/upsert stores `raw_json` (enriched JSON) and also many flat columns.
-    This function prefers the flattened JSON (raw_json) to preserve enrichment fields.
+    Pull incidents from last 365d and aggregate in Python.
+    Assumes violent_crimes table has:
+      - datetime (ISO string)
+      - grid_id
+      - severity (REAL, nullable)
     """
-    db_path = Path(db_path)
-    if not db_path.exists():
-        raise FileNotFoundError(f"DB not found: {db_path}")
+    now = datetime.now(timezone.utc)
+    cutoff_365 = now - timedelta(days=LOOKBACK_DAYS_BASELINE)
+    cutoff_30 = now - timedelta(days=LOOKBACK_DAYS_30)
+    cutoff_7 = now - timedelta(days=LOOKBACK_DAYS_7)
 
-    with sqlite3.connect(str(db_path)) as conn:
-        # prefer raw_json; fallback to selecting all columns where raw_json not present
-        try:
-            rows = pd.read_sql("SELECT raw_json FROM violent_crimes", conn)
-            if "raw_json" in rows.columns:
-                # raw_json column contains JSON strings; convert to records
-                recs = rows["raw_json"].dropna().map(lambda s: json.loads(s)).tolist()
-                df = pd.json_normalize(recs)
-                return df
-        except Exception:
-            log.exception("Failed to load raw_json; trying to read full table")
+    # read only what we need
+    cur = conn.execute(
+        """
+        SELECT datetime, grid_id, severity
+        FROM violent_crimes
+        WHERE datetime IS NOT NULL
+          AND grid_id IS NOT NULL
+        """
+    )
 
-        # fallback: read full table and return as DataFrame
-        df = pd.read_sql("SELECT * FROM violent_crimes", conn)
-        return df
+    agg: Dict[str, GridCounts] = {}
+
+    for dt_s, grid_id, severity in cur:
+        dt_obj = _parse_dt(dt_s)
+        if not dt_obj:
+            continue
+        if dt_obj < cutoff_365:
+            continue  # we only need last 365d for baseline
+
+        gc = agg.get(grid_id)
+        if gc is None:
+            gc = GridCounts(c7=0, c30=0, c365=0, sev30_sum=0.0, sev30_n=0)
+            agg[grid_id] = gc
+
+        # baseline
+        gc.c365 += 1
+
+        # 30d + severity
+        if dt_obj >= cutoff_30:
+            gc.c30 += 1
+            if severity is not None:
+                try:
+                    gc.sev30_sum += float(severity)
+                    gc.sev30_n += 1
+                except Exception:
+                    pass
+
+        # 7d
+        if dt_obj >= cutoff_7:
+            gc.c7 += 1
+
+    return agg
 
 
-def _choose_numeric_features(df: pd.DataFrame, candidates: Optional[Iterable[str]] = None) -> List[str]:
+def _compute_scores(agg: Dict[str, GridCounts]) -> List[Tuple[str, int, int, int, float, int]]:
     """
-    Pick numeric columns to normalize. If candidates provided, return intersection.
-    Typical enriched numeric features: lat, lon, latitude, longitude, severity, hour, day_of_week, month, year.
+    Returns rows: (grid_id, c7, c30, c365, sev_avg_30, score)
     """
-    default_candidates = ["severity", "lat", "lon", "latitude", "longitude", "hour", "day_of_week", "month", "year"]
-    cand = list(candidates) if candidates else default_candidates
-    return [c for c in cand if c in df.columns]
+    c7_vals = sorted([v.c7 for v in agg.values()])
+    c30_vals = sorted([v.c30 for v in agg.values()])
+    c365_vals = sorted([v.c365 for v in agg.values()])
+
+    p95_7 = _percentile(c7_vals, 0.95)
+    p95_30 = _percentile(c30_vals, 0.95)
+    p95_365 = _percentile(c365_vals, 0.95)
+
+    log.info("p95 anchors: 7d=%d 30d=%d 365d=%d (cells=%d)", p95_7, p95_30, p95_365, len(agg))
+
+    out: List[Tuple[str, int, int, int, float, int]] = []
+    for grid_id, v in agg.items():
+        sev_avg_30 = (v.sev30_sum / v.sev30_n) if v.sev30_n else 0.0
+
+        n7 = _log_norm(v.c7, p95_7)
+        n30 = _log_norm(v.c30, p95_30)
+        n365 = _log_norm(v.c365, p95_365)
+
+        risk = (W_30D * n30) + (W_7D * n7) + (W_365D * n365)
+
+        score = int(round(100 * max(0.0, min(1.0, risk))))
+        score = max(MIN_SCORE, min(MAX_SCORE, score))
+
+        out.append((grid_id, v.c7, v.c30, v.c365, float(sev_avg_30), score))
+
+    return out
 
 
-def build_zscore_normalization_layer(
-    df: pd.DataFrame,
-    feature_columns: List[str],
-    *,
-    fillna_with: Optional[float] = None,
-) -> tf.keras.layers.Normalization:
-    """
-    Build and adapt a tf.keras.layers.Normalization layer (z-score) for the given feature columns.
-    - df: DataFrame containing features
-    - feature_columns: list of numeric column names
-    Returns an adapted Normalization layer.
-    """
-    if not feature_columns:
-        raise ValueError("feature_columns must not be empty")
-
-    # Prepare numeric array: coerce to numeric and handle NaNs
-    X = df[feature_columns].apply(pd.to_numeric, errors="coerce")
-    if fillna_with is None:
-        # fill NaN with column medians (robust) to avoid dropping many rows
-        X = X.fillna(X.median())
-    else:
-        X = X.fillna(fillna_with)
-
-    arr = X.to_numpy(dtype="float32")
-    layer = tf.keras.layers.Normalization(axis=-1)
-    layer.adapt(arr)
-    log.info("Normalization layer adapted: mean=%s var=%s", layer.mean.numpy(), layer.variance.numpy())
-    return layer
+def _upsert_risk_grid(conn: sqlite3.Connection, rows: List[Tuple[str, int, int, int, float, int]]) -> None:
+    updated_at = _iso_utc(datetime.now(timezone.utc))
+    conn.executemany(
+        """
+        INSERT INTO risk_grid (
+            grid_id, count_7d, count_30d, count_365d, severity_avg_30d, score_0_100, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(grid_id) DO UPDATE SET
+            count_7d=excluded.count_7d,
+            count_30d=excluded.count_30d,
+            count_365d=excluded.count_365d,
+            severity_avg_30d=excluded.severity_avg_30d,
+            score_0_100=excluded.score_0_100,
+            updated_at=excluded.updated_at
+        """,
+        [(gid, c7, c30, c365, sev, score, updated_at) for (gid, c7, c30, c365, sev, score) in rows],
+    )
+    conn.commit()
 
 
-def save_normalizer(layer: tf.keras.layers.Layer, path: Path = NORMALIZER_DIR) -> Path:
-    """
-    Save the normalization layer as a tiny Keras model so it can be reloaded with tf.keras.models.load_model.
-    """
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    model = tf.keras.Sequential([tf.keras.Input(shape=(int(layer.mean.shape[0]),), dtype=tf.float32), layer])
-    # overwrite if exists
-    tf.keras.models.save_model(model, str(path), overwrite=True, include_optimizer=False)
-    log.info("Saved normalizer model -> %s", path)
-    return path
+def build_risk_grid(db_path=DB_PATH) -> None:
+    db_path = str(db_path)
+    conn = sqlite3.connect(db_path, timeout=60)
+    try:
+        _ensure_risk_table(conn)
 
+        agg = _load_counts(conn)
+        if not agg:
+            log.warning("No rows found to aggregate. Is your DB populated?")
+            return
 
-def load_normalizer(path: Path = NORMALIZER_DIR) -> tf.keras.Model:
-    """
-    Load the saved normalizer model; it returns a model that maps raw feature vector -> normalized vector.
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    model = tf.keras.models.load_model(str(path))
-    log.info("Loaded normalizer model from %s", path)
-    return model
+        rows = _compute_scores(agg)
+        _upsert_risk_grid(conn, rows)
 
+        # quick sanity print
+        top = sorted(rows, key=lambda r: r[-1], reverse=True)[:10]
+        log.info("Top 10 risk cells (grid_id, 7d, 30d, 365d, sev_avg_30, score):")
+        for r in top:
+            log.info("%s", r)
 
-def normalize_dataframe(df: pd.DataFrame, feature_columns: List[str], normalizer_model: tf.keras.Model) -> pd.DataFrame:
-    """
-    Apply the saved normalizer model to a DataFrame and return a new DataFrame of normalized features.
-    """
-    X = df[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(df[feature_columns].median())
-    arr = X.to_numpy(dtype="float32")
-    normalized = normalizer_model.predict(arr, batch_size=8192)
-    out = pd.DataFrame(normalized, columns=[f"{c}_norm" for c in feature_columns], index=df.index)
-    return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
-
-
-def example_workflow(
-    db_path: Optional[Path] = None,
-    feature_columns: Optional[List[str]] = None,
-    save_dir: Optional[Path] = None,
-) -> Path:
-    """
-    Example end-to-end:
-      1. Load enriched backfill data from the sqlite DB
-      2. Pick numeric features
-      3. Build/adapt a z-score normalization layer
-      4. Save the layer as a small Keras model
-      5. Return path to saved normalizer
-    """
-    db = Path(db_path) if db_path else DB_PATH
-    save_dir = Path(save_dir) if save_dir else NORMALIZER_DIR
-
-    df = _load_enriched_from_sqlite(db)
-    features = feature_columns or _choose_numeric_features(df)
-    if not features:
-        raise RuntimeError("No numeric features found in the loaded DataFrame")
-
-    normalizer = build_zscore_normalization_layer(df, features)
-    model_path = save_normalizer(normalizer, save_dir)
-    return model_path
+        log.info("risk_grid updated (%d cells) -> %s", len(rows), db_path)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    # Quick demo:
-    #  - run backfill to populate DB first (chicago_data_backfill.backfill_chicago_violent_crimes)
-    #  - then run this file to build and save a normalizer
-    try:
-        p = example_workflow()
-        print("Normalizer saved to:", p)
-    except Exception as e:
-        log.exception("Example workflow failed: %s", e)
+    build_risk_grid()
