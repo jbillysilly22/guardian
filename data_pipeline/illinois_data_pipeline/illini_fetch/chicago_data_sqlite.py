@@ -34,10 +34,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 CRIME_DATASET_ID = "ijzp-q8t2"  # Chicago crimes dataset id used elsewhere in repo
-INTERVAL_SECONDS = 60 * 10  # how often to poll (10 minutes)
-DB_DIR = PROJECT_ROOT / "data_pipeline" / "illinois_data_pipeline" / "illini_fetch" / "chicago_filtered_data"
+INTERVAL_SECONDS = 60 * 10  
+from core.paths import app_data_dir
+
+DB_DIR = app_data_dir("guardian")
 DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "violent_crimes.sqlite"
+
 
 
 def _ensure_table(conn: sqlite3.Connection) -> None:

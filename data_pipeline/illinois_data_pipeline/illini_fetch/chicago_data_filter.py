@@ -9,9 +9,12 @@ from typing import Dict, Any, Optional, Tuple
 import sys
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+from core.paths import project_root
+
+PROJECT_ROOT = project_root()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
 
 from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
     iter_dataset_rows,
@@ -172,7 +175,7 @@ if __name__ == "__main__":
 
     cfg = FetchConfig(
         per_page=1000,
-        max_pages=2,   # bump to 10 to test more
+        max_pages=2,   
         pause_s=0.2,
         timeout_s=15,
     )
