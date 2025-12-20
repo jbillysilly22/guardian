@@ -1,5 +1,7 @@
 
-
+requests
+numpy
+pandas
 folium
 geopandas 
 fiona

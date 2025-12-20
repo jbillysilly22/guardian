@@ -13,6 +13,9 @@ from core.paths import app_data_dir
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+print("DB_PATH =", DB_PATH)
+
+
 
 # ---- config ----
 DB_PATH = app_data_dir("guardian") / "violent_crimes.sqlite"
