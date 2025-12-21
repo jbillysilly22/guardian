@@ -1,14 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import os
-import sqlite3
 import sys
 import time
-from datetime import datetime as _dt
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -27,187 +22,18 @@ from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_cat
     collect_datasets,
     ChicagoDataset,
 )
-from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import (
-    enrich_row,
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import enrich_row
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_sqlite import (
+    DB_PATH,
+    ensure_schema,
+    get_conn,
+    _upsert_enriched,
 )
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 CRIME_DATASET_ID = "ijzp-q8t2"
-
-
-
-
-def _app_data_dir(app_name: str = "guardian") -> Path:
-    override = os.environ.get("GUARDIAN_DATA_DIR")
-    if override:
-        return Path(override).expanduser().resolve()
-
-    if sys.platform.startswith("win"):
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        return (Path(base) / app_name) if base else (Path.home() / app_name)
-
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / app_name
-
-    base = os.environ.get("XDG_DATA_HOME")
-    return (Path(base) / app_name) if base else (Path.home() / ".local" / "share" / app_name)
-
-
-DB_DIR = _app_data_dir("guardian")
-DB_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DB_DIR / "violent_crimes.sqlite"
-
-
-
-
-CREATE_VIOLENT_SQL = """
-CREATE TABLE IF NOT EXISTS violent_crimes (
-    case_number TEXT PRIMARY KEY,
-    row_hash TEXT,
-    datetime TEXT,
-    primary_type TEXT,
-    primary_type_norm TEXT,
-    description TEXT,
-    location_description TEXT,
-    arrest INTEGER,
-    domestic INTEGER,
-    beat INTEGER,
-    district INTEGER,
-    ward INTEGER,
-    community_area INTEGER,
-    fbi_code TEXT,
-    x_coordinate INTEGER,
-    y_coordinate INTEGER,
-    latitude REAL,
-    longitude REAL,
-    lat REAL,
-    lon REAL,
-    grid_id TEXT,
-    severity REAL,
-    is_violent INTEGER,
-    domain TEXT,
-    raw_json TEXT,
-    last_seen_at TEXT
-);
-"""
-
-CREATE_META_SQL = """
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-UPSERT_SQL = """
-INSERT INTO violent_crimes (
-    case_number, row_hash, datetime, primary_type, primary_type_norm, description,
-    location_description, arrest, domestic, beat, district, ward, community_area,
-    fbi_code, x_coordinate, y_coordinate, latitude, longitude, lat, lon, grid_id,
-    severity, is_violent, domain, raw_json, last_seen_at
-) VALUES (
-    :case_number, :row_hash, :datetime, :primary_type, :primary_type_norm, :description,
-    :location_description, :arrest, :domestic, :beat, :district, :ward, :community_area,
-    :fbi_code, :x_coordinate, :y_coordinate, :latitude, :longitude, :lat, :lon, :grid_id,
-    :severity, :is_violent, :domain, :raw_json, :last_seen_at
-)
-ON CONFLICT(case_number) DO UPDATE SET
-    row_hash=excluded.row_hash,
-    datetime=excluded.datetime,
-    primary_type=excluded.primary_type,
-    primary_type_norm=excluded.primary_type_norm,
-    description=excluded.description,
-    location_description=excluded.location_description,
-    arrest=excluded.arrest,
-    domestic=excluded.domestic,
-    beat=excluded.beat,
-    district=excluded.district,
-    ward=excluded.ward,
-    community_area=excluded.community_area,
-    fbi_code=excluded.fbi_code,
-    x_coordinate=excluded.x_coordinate,
-    y_coordinate=excluded.y_coordinate,
-    latitude=excluded.latitude,
-    longitude=excluded.longitude,
-    lat=excluded.lat,
-    lon=excluded.lon,
-    grid_id=excluded.grid_id,
-    severity=excluded.severity,
-    is_violent=excluded.is_violent,
-    domain=excluded.domain,
-    raw_json=excluded.raw_json,
-    last_seen_at=excluded.last_seen_at;
-"""
-
-
-def _ensure_tables(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.executescript(CREATE_VIOLENT_SQL)
-    conn.executescript(CREATE_META_SQL)
-    conn.commit()
-
-
-def _meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
-    cur = conn.execute("SELECT value FROM meta WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-
-def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
-    conn.execute(
-        "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-    conn.commit()
-
-
-def _make_case_key(row: Dict[str, Any]) -> str:
-    case = row.get("case_number") or row.get("case") or row.get("id")
-    if case:
-        return str(case)
-    raw = json.dumps({k: row.get(k) for k in sorted(row.keys())}, sort_keys=True, default=str)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-
-def _vals_from_enriched(enriched: Dict[str, Any]) -> Dict[str, Any]:
-    key = _make_case_key(enriched)
-    row_hash = hashlib.sha1(json.dumps(enriched, sort_keys=True, default=str).encode()).hexdigest()
-    now = _dt.utcnow().isoformat()
-
-    return {
-        "case_number": key,
-        "row_hash": row_hash,
-        "datetime": enriched.get("datetime"),
-        "primary_type": enriched.get("primary_type") or enriched.get("offense") or enriched.get("category"),
-        "primary_type_norm": enriched.get("primary_type_norm"),
-        "description": enriched.get("description"),
-        "location_description": enriched.get("location_description"),
-        "arrest": int(bool(enriched.get("arrest"))) if enriched.get("arrest") is not None else None,
-        "domestic": int(bool(enriched.get("domestic"))) if enriched.get("domestic") is not None else None,
-        "beat": enriched.get("beat"),
-        "district": enriched.get("district"),
-        "ward": enriched.get("ward"),
-        "community_area": enriched.get("community_area"),
-        "fbi_code": enriched.get("fbi_code"),
-        "x_coordinate": enriched.get("x_coordinate"),
-        "y_coordinate": enriched.get("y_coordinate"),
-        "latitude": enriched.get("latitude") or enriched.get("lat"),
-        "longitude": enriched.get("longitude") or enriched.get("lon"),
-        "lat": enriched.get("lat"),
-        "lon": enriched.get("lon"),
-        "grid_id": enriched.get("grid_id"),
-        "severity": enriched.get("severity"),
-        "is_violent": int(bool(enriched.get("is_violent"))),
-        "domain": enriched.get("domain"),
-        "raw_json": json.dumps(enriched, ensure_ascii=False),
-        "last_seen_at": now,
-    }
-
-
-
 
 def _find_dataset(dataset_id: str) -> Optional[ChicagoDataset]:
     datasets = collect_datasets(limit=500)
@@ -348,12 +174,13 @@ def backfill_chicago_violent_crimes(
         return
 
     session = _make_session(cfg.app_token)
-    conn = sqlite3.connect(str(DB_PATH), timeout=60)
-    _ensure_tables(conn)
+    conn = get_conn(timeout=60)
+    ensure_schema(conn)
 
     try:
         if resume:
-            last_year = _meta_get(conn, "backfill_last_completed_year")
+            last_year = conn.execute("SELECT value FROM meta WHERE key=?", ("backfill_last_completed_year",)).fetchone()
+            last_year = last_year[0] if last_year else None
             if last_year and last_year.isdigit():
                 start_year = max(start_year, int(last_year) + 1)
 
@@ -390,8 +217,7 @@ def backfill_chicago_violent_crimes(
                     continue
 
                 try:
-                    vals = _vals_from_enriched(enriched)
-                    cur.execute(UPSERT_SQL, vals)
+                    _upsert_enriched(conn, enriched)
                     saved += 1
                     batch += 1
                 except Exception:
@@ -408,9 +234,19 @@ def backfill_chicago_violent_crimes(
 
             total_saved += saved
             if resume:
-                _meta_set(conn, "backfill_last_completed_year", str(year))
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("backfill_last_completed_year", str(year)),
+                )
+                conn.commit()
 
-        log.info("Backfill complete: total_saved=%d DB=%s", total_saved, DB_PATH)
+        try:
+            total_rows = conn.execute("SELECT COUNT(*) FROM violent_crimes").fetchone()[0]
+        except Exception:
+            total_rows = None
+            log.exception("Failed to count violent_crimes after backfill")
+
+        log.info("Backfill complete: total_saved=%d DB=%s total_rows=%s", total_saved, DB_PATH, total_rows)
 
     finally:
         conn.close()

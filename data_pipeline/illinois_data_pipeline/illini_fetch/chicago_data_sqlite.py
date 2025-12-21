@@ -1,15 +1,15 @@
 ﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
+import json
 import logging
 import sqlite3
 import sys
 import time
-import json
-import hashlib
 from pathlib import Path
-from typing import Dict, Any, Optional
-import datetime as dt
+from typing import Any, Dict, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -42,8 +42,15 @@ DB_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DB_DIR / "violent_crimes.sqlite"
 
 
+def get_conn(*, timeout: int = 30) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=timeout)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
 
-def _ensure_table(conn: sqlite3.Connection) -> None:
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS violent_crimes (
@@ -73,6 +80,14 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
             domain TEXT,
             raw_json TEXT,
             last_seen_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
         """
     )
@@ -168,7 +183,6 @@ def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None
         """,
         vals,
     )
-    conn.commit()
 
 
 def _find_crime_dataset() -> Optional[ChicagoDataset]:
@@ -179,15 +193,15 @@ def _find_crime_dataset() -> Optional[ChicagoDataset]:
     return ds
 
 
-def run_forever(poll_interval: int = INTERVAL_SECONDS) -> None:
+def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000) -> None:
     cfg = FetchConfig(per_page=1000, pause_s=0.2, timeout_s=15, app_token=None)
     session = _make_session(cfg.app_token)
     ds = _find_crime_dataset()
     if not ds:
         return
 
-    conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    _ensure_table(conn)
+    conn = get_conn(timeout=30)
+    ensure_schema(conn)
     log.info("Started continuous pull → DB: %s (interval %ds)", DB_PATH, poll_interval)
 
     try:
@@ -195,6 +209,7 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS) -> None:
             count_inserted = 0
             count_seen = 0
             try:
+                batch = 0
                 for raw_row in iter_dataset_rows(ds, session=session, cfg=cfg):
                     count_seen += 1
                     enriched = enrich_row(raw_row)
@@ -203,10 +218,27 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS) -> None:
                         continue
                     _upsert_enriched(conn, enriched)
                     count_inserted += 1
+                    batch += 1
+
+                    if batch >= commit_every:
+                        conn.commit()
+                        batch = 0
             except Exception:
                 log.exception("Error while fetching/enriching rows; will continue on next cycle")
 
-            log.info("Cycle complete: seen=%d violent_saved=%d", count_seen, count_inserted)
+            if batch:
+                conn.commit()
+
+            try:
+                total_rows = conn.execute("SELECT COUNT(*) FROM violent_crimes").fetchone()[0]
+                log.info(
+                    "Cycle complete: seen=%d violent_saved=%d total_rows=%d",
+                    count_seen,
+                    count_inserted,
+                    total_rows,
+                )
+            except Exception:
+                log.exception("Failed to count violent_crimes rows after cycle")
             time.sleep(poll_interval)
 
     except KeyboardInterrupt:
