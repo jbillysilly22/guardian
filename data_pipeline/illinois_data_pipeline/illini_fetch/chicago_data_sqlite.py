@@ -25,9 +25,8 @@ from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_cat
     collect_datasets,
     ChicagoDataset,
 )
-from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import (
-    enrich_row,
-)
+
+
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -249,6 +248,8 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
 
 if __name__ == "__main__":
     run_forever()
+    from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import enrich_row
+
 
 
 

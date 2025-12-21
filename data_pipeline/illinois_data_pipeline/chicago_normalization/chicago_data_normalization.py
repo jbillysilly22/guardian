@@ -21,7 +21,7 @@ LOOKBACK_DAYS_BASELINE = 365
 LOOKBACK_DAYS_30 = 30
 LOOKBACK_DAYS_7 = 7
 
-# weights: tune later
+#  tune later
 W_30D = 0.55
 W_7D = 0.30
 W_365D = 0.15
