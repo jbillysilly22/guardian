@@ -179,16 +179,26 @@ def run_ingest_to_db(
     only_violent: bool = True,
     commit_every: int = 5000,
 ) -> None:
+    dataset_id = (dataset_id or "").strip().lower()
+    if not dataset_id:
+        raise ValueError("dataset_id is empty")
+
     cfg = cfg or FetchConfig(per_page=1000, pause_s=0.2, timeout_s=30, app_token=None)
 
-    ds = next((d for d in collect_datasets(limit=500) if d.dataset_id == dataset_id), None)
+    # IMPORTANT: limit=500 can miss ijzp-q8t2; use a bigger limit + the same "public safety" filter
+    datasets = collect_datasets(text_filter="public safety", limit=5000)
+    ds = next((d for d in datasets if (getattr(d, "dataset_id", "") or "").strip().lower() == dataset_id), None)
+
     if not ds:
-        raise RuntimeError(f"Dataset {dataset_id} not found")
+        sample_ids = [getattr(d, "dataset_id", None) for d in datasets[:25]]
+        raise RuntimeError(
+            f"Dataset {dataset_id} not found. Sample catalog ids={sample_ids}"
+        )
 
     session = _make_session(cfg.app_token)
     conn = get_conn(timeout=60)
     ensure_schema(conn)
-    log.info("Ingesting dataset %s into DB=%s", dataset_id, DB_PATH)
+    log.info("Ingesting dataset=%s into DB=%s", dataset_id, DB_PATH)
 
     seen = 0
     saved = 0
@@ -197,11 +207,22 @@ def run_ingest_to_db(
     try:
         for row in iter_dataset_rows(ds, session=session, cfg=cfg):
             seen += 1
-            enriched = enrich_row(row)
+
+            try:
+                enriched = enrich_row(row)
+            except Exception:
+                log.exception("enrich_row failed; skipping row")
+                continue
+
             if only_violent and not enriched.get("is_violent"):
                 continue
 
-            _upsert_enriched(conn, enriched)
+            try:
+                _upsert_enriched(conn, enriched)
+            except Exception:
+                log.exception("DB upsert failed; skipping row")
+                continue
+
             saved += 1
             batch += 1
 
@@ -214,7 +235,7 @@ def run_ingest_to_db(
 
         total_rows = conn.execute("SELECT COUNT(*) FROM violent_crimes").fetchone()[0]
         log.info(
-            "Ingest complete for dataset %s: seen=%d saved=%d total_rows=%d DB=%s",
+            "Ingest complete: dataset=%s seen=%d saved=%d total_rows=%d DB=%s",
             dataset_id,
             seen,
             saved,
@@ -222,7 +243,12 @@ def run_ingest_to_db(
             DB_PATH,
         )
     finally:
+        try:
+            session.close()
+        except Exception:
+            pass
         conn.close()
+
 
 
 

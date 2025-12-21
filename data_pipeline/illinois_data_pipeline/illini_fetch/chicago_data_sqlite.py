@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -26,14 +25,12 @@ from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_cat
     ChicagoDataset,
 )
 
-
-
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-
 CRIME_DATASET_ID = "ijzp-q8t2"  # Chicago crimes dataset id used elsewhere in repo
-INTERVAL_SECONDS = 60 * 10  
+INTERVAL_SECONDS = 60 * 10
+
 from core.paths import app_data_dir
 
 DB_DIR = app_data_dir("guardian")
@@ -46,6 +43,8 @@ def get_conn(*, timeout: int = 30) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
+    # optional but helpful if you ever have two writers briefly overlap
+    conn.execute("PRAGMA busy_timeout=60000;")  # 60s
     return conn
 
 
@@ -94,11 +93,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _make_case_key(row: Dict[str, Any]) -> str:
-    
     case = row.get("case_number") or row.get("case") or row.get("id")
     if case:
         return str(case)
-    # stable hash for rows without a case number
     raw = json.dumps({k: row.get(k) for k in sorted(row.keys())}, sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -109,7 +106,6 @@ def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None
     row_hash = hashlib.sha1(json.dumps(enriched, sort_keys=True, default=str).encode()).hexdigest()
     now = dt.datetime.utcnow().isoformat()
 
-    # map fields; use .get to avoid KeyError
     vals = {
         "case_number": key,
         "row_hash": row_hash,
@@ -139,7 +135,6 @@ def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None
         "last_seen_at": now,
     }
 
-    
     cur.execute(
         """
         INSERT INTO violent_crimes (
@@ -193,6 +188,9 @@ def _find_crime_dataset() -> Optional[ChicagoDataset]:
 
 
 def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000) -> None:
+    # local import avoids circular import at module import-time
+    from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import enrich_row
+
     cfg = FetchConfig(per_page=1000, pause_s=0.2, timeout_s=15, app_token=None)
     session = _make_session(cfg.app_token)
     ds = _find_crime_dataset()
@@ -207,14 +205,22 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
         while True:
             count_inserted = 0
             count_seen = 0
+            batch = 0
+
             try:
-                batch = 0
                 for raw_row in iter_dataset_rows(ds, session=session, cfg=cfg):
                     count_seen += 1
-                    enriched = enrich_row(raw_row)
-                    # only store violent rows (matches filter behavior in your snippet)
+
+                    try:
+                        enriched = enrich_row(raw_row)
+                    except Exception:
+                        log.exception("Failed to enrich row; skipping")
+                        continue
+
+                    # only store violent rows
                     if not enriched.get("is_violent"):
                         continue
+
                     _upsert_enriched(conn, enriched)
                     count_inserted += 1
                     batch += 1
@@ -222,6 +228,7 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
                     if batch >= commit_every:
                         conn.commit()
                         batch = 0
+
             except Exception:
                 log.exception("Error while fetching/enriching rows; will continue on next cycle")
 
@@ -238,6 +245,7 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
                 )
             except Exception:
                 log.exception("Failed to count violent_crimes rows after cycle")
+
             time.sleep(poll_interval)
 
     except KeyboardInterrupt:
@@ -248,9 +256,5 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
 
 if __name__ == "__main__":
     run_forever()
-    from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import enrich_row
 
-
-
-
-    #watch for bad sqlite and bad dtc deprecation warnings gotta upddate stuff
+# watch for bad sqlite and bad dtc deprecation warnings gotta upddate stuff

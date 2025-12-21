@@ -36,11 +36,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 CRIME_DATASET_ID = "ijzp-q8t2"
 
 def _find_dataset(dataset_id: str) -> Optional[ChicagoDataset]:
-    datasets = collect_datasets(limit=500)
-    ds = next((d for d in datasets if d.dataset_id == dataset_id), None)
-    if not ds:
-        log.error("Dataset %s not found in catalog", dataset_id)
-    return ds
+    # ijzp-q8t2 isn't guaranteed to show up in the first 500 results trying to fix that error
+    for lim in (500, 2000, 5000, 10000):
+        datasets = collect_datasets(limit=lim)
+        ds = next((d for d in datasets if getattr(d, "dataset_id", None) == dataset_id), None)
+        if ds:
+            return ds
+
+    log.error("Dataset %s not found in catalog (searched up to 10k results)", dataset_id)
+    return None
+
 
 
 def _request_json_with_retry(
