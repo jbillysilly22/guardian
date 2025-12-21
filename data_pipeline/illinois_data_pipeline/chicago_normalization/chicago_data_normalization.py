@@ -8,17 +8,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
-from core.paths import app_data_dir
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_sqlite import (
+    DB_PATH,
+    ensure_schema,
+    get_conn,
+)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-print("DB_PATH =", DB_PATH)
-
-
-
-# ---- config ----
-DB_PATH = app_data_dir("guardian") / "violent_crimes.sqlite"
 LOOKBACK_DAYS_BASELINE = 365
 LOOKBACK_DAYS_30 = 30
 LOOKBACK_DAYS_7 = 7
@@ -200,9 +198,10 @@ def _upsert_risk_grid(conn: sqlite3.Connection, rows: List[Tuple[str, int, int, 
 
 
 def build_risk_grid(db_path=DB_PATH) -> None:
-    db_path = str(db_path)
-    conn = sqlite3.connect(db_path, timeout=60)
+    log.info("Building risk grid using DB=%s", DB_PATH)
+    conn = get_conn(timeout=60)
     try:
+        ensure_schema(conn)
         _ensure_risk_table(conn)
 
         agg = _load_counts(conn)
@@ -219,10 +218,12 @@ def build_risk_grid(db_path=DB_PATH) -> None:
         for r in top:
             log.info("%s", r)
 
-        log.info("risk_grid updated (%d cells) -> %s", len(rows), db_path)
+        total_rows = conn.execute("SELECT COUNT(*) FROM risk_grid").fetchone()[0]
+        log.info("risk_grid updated (%d cells) -> %s (rows now %d)", len(rows), DB_PATH, total_rows)
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
+    log.info("Building risk grid from DB=%s", DB_PATH)
     build_risk_grid()

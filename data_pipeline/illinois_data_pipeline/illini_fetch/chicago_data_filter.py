@@ -1,12 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
 import datetime as dt
+import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
 import sys
+from typing import Any, Dict, Optional, Tuple
 
 
 from core.paths import project_root
@@ -24,6 +24,12 @@ from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher impo
 from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_catalog import (
     collect_datasets,
     ChicagoDataset,
+)
+from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_sqlite import (
+    DB_PATH,
+    ensure_schema,
+    get_conn,
+    _upsert_enriched,
 )
 
 log = logging.getLogger(__name__)
@@ -166,6 +172,59 @@ def run_enrichment(
     return out_file
 
 
+def run_ingest_to_db(
+    dataset_id: str,
+    cfg: Optional[FetchConfig] = None,
+    *,
+    only_violent: bool = True,
+    commit_every: int = 5000,
+) -> None:
+    cfg = cfg or FetchConfig(per_page=1000, pause_s=0.2, timeout_s=30, app_token=None)
+
+    ds = next((d for d in collect_datasets(limit=500) if d.dataset_id == dataset_id), None)
+    if not ds:
+        raise RuntimeError(f"Dataset {dataset_id} not found")
+
+    session = _make_session(cfg.app_token)
+    conn = get_conn(timeout=60)
+    ensure_schema(conn)
+    log.info("Ingesting dataset %s into DB=%s", dataset_id, DB_PATH)
+
+    seen = 0
+    saved = 0
+    batch = 0
+
+    try:
+        for row in iter_dataset_rows(ds, session=session, cfg=cfg):
+            seen += 1
+            enriched = enrich_row(row)
+            if only_violent and not enriched.get("is_violent"):
+                continue
+
+            _upsert_enriched(conn, enriched)
+            saved += 1
+            batch += 1
+
+            if batch >= commit_every:
+                conn.commit()
+                batch = 0
+
+        if batch:
+            conn.commit()
+
+        total_rows = conn.execute("SELECT COUNT(*) FROM violent_crimes").fetchone()[0]
+        log.info(
+            "Ingest complete for dataset %s: seen=%d saved=%d total_rows=%d DB=%s",
+            dataset_id,
+            seen,
+            saved,
+            total_rows,
+            DB_PATH,
+        )
+    finally:
+        conn.close()
+
+
 
 if __name__ == "__main__":
     DATASET_IDS = [
@@ -182,3 +241,5 @@ if __name__ == "__main__":
 
     for dsid in DATASET_IDS:
         run_enrichment(dsid, cfg=cfg)
+
+    run_ingest_to_db("ijzp-q8t2", cfg=cfg, only_violent=True, commit_every=5000)
