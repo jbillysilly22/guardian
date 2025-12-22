@@ -15,6 +15,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from core.paths import app_data_dir
+
 from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_fetcher import (
     iter_dataset_rows,
     FetchConfig,
@@ -28,10 +30,8 @@ from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_endpoint_cat
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-CRIME_DATASET_ID = "ijzp-q8t2"  # Chicago crimes dataset id used elsewhere in repo
+CRIME_DATASET_ID = "ijzp-q8t2"  # Chicago crimes dataset id used elsewhere in repo i think in filter file
 INTERVAL_SECONDS = 60 * 10
-
-from core.paths import app_data_dir
 
 DB_DIR = app_data_dir("guardian")
 DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,7 +43,6 @@ def get_conn(*, timeout: int = 30) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    # optional but helpful if you ever have two writers briefly overlap
     conn.execute("PRAGMA busy_timeout=60000;")  # 60s
     return conn
 
@@ -96,15 +95,20 @@ def _make_case_key(row: Dict[str, Any]) -> str:
     case = row.get("case_number") or row.get("case") or row.get("id")
     if case:
         return str(case)
+
     raw = json.dumps({k: row.get(k) for k in sorted(row.keys())}, sort_keys=True, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _utc_now_iso() -> str:
+    # timezone-aware UTC (avoids utcnow deprecation)
+    return dt.datetime.now(dt.UTC).isoformat()
+
+
 def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None:
-    cur = conn.cursor()
     key = _make_case_key(enriched)
     row_hash = hashlib.sha1(json.dumps(enriched, sort_keys=True, default=str).encode()).hexdigest()
-    now = dt.datetime.utcnow().isoformat()
+    now = _utc_now_iso()
 
     vals = {
         "case_number": key,
@@ -129,13 +133,13 @@ def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None
         "lon": enriched.get("lon"),
         "grid_id": enriched.get("grid_id"),
         "severity": enriched.get("severity"),
-        "is_violent": int(bool(enriched.get("is_violent"))),
+        "is_violent": int(bool(enriched.get("is_violent"))) if enriched.get("is_violent") is not None else 0,
         "domain": enriched.get("domain"),
         "raw_json": json.dumps(enriched, ensure_ascii=False),
         "last_seen_at": now,
     }
 
-    cur.execute(
+    conn.execute(
         """
         INSERT INTO violent_crimes (
             case_number, row_hash, datetime, primary_type, primary_type_norm, description,
@@ -179,32 +183,46 @@ def _upsert_enriched(conn: sqlite3.Connection, enriched: Dict[str, Any]) -> None
     )
 
 
+def _find_dataset(dataset_id: str) -> Optional[ChicagoDataset]:
+    
+    datasets = collect_datasets(limit=5000)
+    for d in datasets:
+        did = getattr(d, "dataset_id", None)
+        if did == dataset_id:
+            return d
+
+    log.error("Dataset %s not found in catalog (fetched=%d)", dataset_id, len(datasets))
+    return None
+
+
 def _find_crime_dataset() -> Optional[ChicagoDataset]:
-    datasets = collect_datasets()
-    ds = next((d for d in datasets if d.dataset_id == CRIME_DATASET_ID), None)
-    if not ds:
-        log.error("Crime dataset %s not found in catalog", CRIME_DATASET_ID)
-    return ds
+    return _find_dataset(CRIME_DATASET_ID)
 
 
-def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000) -> None:
+def run_forever(
+    poll_interval: int = INTERVAL_SECONDS,
+    commit_every: int = 1000,
+    *,
+    only_violent: bool = False,
+) -> None:
     # local import avoids circular import at module import-time
     from data_pipeline.illinois_data_pipeline.illini_fetch.chicago_data_filter import enrich_row
 
     cfg = FetchConfig(per_page=1000, pause_s=0.2, timeout_s=15, app_token=None)
     session = _make_session(cfg.app_token)
+
     ds = _find_crime_dataset()
     if not ds:
         return
 
     conn = get_conn(timeout=30)
     ensure_schema(conn)
-    log.info("Started continuous pull → DB: %s (interval %ds)", DB_PATH, poll_interval)
+    log.info("Started continuous pull → DB: %s (interval=%ds only_violent=%s)", DB_PATH, poll_interval, only_violent)
 
     try:
         while True:
-            count_inserted = 0
             count_seen = 0
+            count_saved = 0
             batch = 0
 
             try:
@@ -217,13 +235,16 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
                         log.exception("Failed to enrich row; skipping")
                         continue
 
-                    # only store violent rows
-                    if not enriched.get("is_violent"):
+                    if only_violent and not enriched.get("is_violent"):
                         continue
 
-                    _upsert_enriched(conn, enriched)
-                    count_inserted += 1
-                    batch += 1
+                    try:
+                        _upsert_enriched(conn, enriched)
+                        count_saved += 1
+                        batch += 1
+                    except Exception:
+                        log.exception("Failed to upsert row; skipping")
+                        continue
 
                     if batch >= commit_every:
                         conn.commit()
@@ -238,9 +259,9 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
             try:
                 total_rows = conn.execute("SELECT COUNT(*) FROM violent_crimes").fetchone()[0]
                 log.info(
-                    "Cycle complete: seen=%d violent_saved=%d total_rows=%d",
+                    "Cycle complete: seen=%d saved=%d total_rows=%d",
                     count_seen,
-                    count_inserted,
+                    count_saved,
                     total_rows,
                 )
             except Exception:
@@ -255,6 +276,14 @@ def run_forever(poll_interval: int = INTERVAL_SECONDS, commit_every: int = 1000)
 
 
 if __name__ == "__main__":
-    run_forever()
+    import time
+    t0 = time.perf_counter()
 
-# watch for bad sqlite and bad dtc deprecation warnings gotta upddate stuff
+    print("db initialization started")
+    conn = get_conn(timeout=30)
+    ensure_schema(conn)
+    conn.close()
+
+    print(f"db initialization finished in {time.perf_counter() - t0:.3f}s")
+    
+    #run_forever()

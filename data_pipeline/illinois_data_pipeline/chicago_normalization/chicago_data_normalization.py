@@ -101,7 +101,7 @@ def _load_counts(conn: sqlite3.Connection) -> Dict[str, GridCounts]:
     cutoff_30 = now - timedelta(days=LOOKBACK_DAYS_30)
     cutoff_7 = now - timedelta(days=LOOKBACK_DAYS_7)
 
-    # read only what we need
+    
     cur = conn.execute(
         """
         SELECT datetime, grid_id, severity
